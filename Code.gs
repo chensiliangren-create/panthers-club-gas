@@ -1,3 +1,11 @@
+/**
+ * Panthers Club Code.gs
+ * PDF取込 + Gemini解析 + PlayerStats_Import正式反映 完全版
+ */
+
+/**
+ * PDFスタッツをGeminiで解析し、PlayerStats_Importへ書き込む。
+ */
 function processStatsUpload(pdfBlob, gameIdRaw) {
   const gameId = normalizeGameId_(gameIdRaw);
   const geminiResponse = analyzeStatsWithGemini(pdfBlob);
@@ -408,7 +416,7 @@ function validateImportRow_(rowObj, context) {
 
 /**
  * PlayerStatsへ書き込む1行分のオブジェクトを作る。
- * PlayerStats.PlayerID には、背番号ではなく正式PlayerIDを入れる。
+ * PlayerStats.SeasonID / GameID / PlayerID は明示的に正式値を書き込む。
  */
 function buildPlayerStatsRow_(importRow, statsHeaders, resolvedPlayerId, normalizedGameId) {
   const row = {};
@@ -423,13 +431,18 @@ function buildPlayerStatsRow_(importRow, statsHeaders, resolvedPlayerId, normali
       return;
     }
 
-    if (header === 'PlayerID') {
-      row[header] = resolvedPlayerId;
+    if (header === 'SeasonID') {
+      row[header] = normalizeText_(importRow.SeasonID);
       return;
     }
 
     if (header === 'GameID') {
-      row[header] = normalizedGameId;
+      row[header] = normalizeGameId_(normalizedGameId);
+      return;
+    }
+
+    if (header === 'PlayerID') {
+      row[header] = resolvedPlayerId;
       return;
     }
 
