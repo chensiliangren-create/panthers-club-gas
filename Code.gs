@@ -361,6 +361,7 @@ function recalcTeamGameSummary(gameId) {
     throw new Error('GameID が空です。');
   }
 
+
   const statsData = readSheetObjects_(statsSheet);
   const targetRows = statsData.rows.filter(function(row) {
     return normalizeGameId_(row.GameID) === targetGameId &&
@@ -1148,4 +1149,7 @@ function createImportError_(errorCode, message) {
   const error = new Error(message);
   error.errorCode = errorCode;
   return error;
+}
+  function testRecalcTeamGameSummary_GAME0604() {
+  recalcTeamGameSummary('GAME0604');
 }
