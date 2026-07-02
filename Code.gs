@@ -111,7 +111,7 @@ function analyzeStatsWithGemini(pdfBlob) {
     contents: [{
       parts: [
         {
-          text: 'PDFの統計表から、以下のキー名でJSON配列として抽出してください。PlayerNoは背番号です。PlayerIDではありません。キー: PlayerNo, GS, PTS, eFG%, 3P/M, 3P/A, 3P%, 2P/M, 2P/A, 2P%, FT/M, FT/A, FT%, OREB, DREB, TOTREB, AST, STL, BLK, TO, PF, TF, OF, MIN, +/-, PPP, TO%, OREB%, FTR'
+          text: 'PDFの統計表から、以下のキー名でJSON配列として抽出してください。PlayerNoは背番号です。PlayerIDではありません。TOTALS行、合計行、チーム合計行は除外してください。キー: PlayerNo, GS, PTS, eFG%, 3P/M, 3P/A, 3P%, 2P/M, 2P/A, 2P%, FT/M, FT/A, FT%, OREB, DREB, TOTREB, AST, STL, BLK, TO, PF, TF, OF, MIN, +/-, PPP, TO%, OREB%, FTR'
         },
         {
           inline_data: {
@@ -263,7 +263,7 @@ function approveAndCommitPlayerStatsImport() {
           );
         }
 
-        const statsRow = buildPlayerStatsRow_(rowObj, statsHeaders, resolvedPlayerId, gameId);
+        const statsRow = buildPlayerStatsRow_(rowObj, statsHeaders, resolvedPlayerId);
         appendByHeader_(statsSheet, statsRow);
 
         existingStatsKeys.add(uniqueKey);
@@ -351,6 +351,10 @@ function approveAndCommitPlayerStatsImport() {
  * 正式反映対象行かどうかを判定する。
  */
 function isCommitTarget_(rowObj) {
+  if (isTotalsRow_(rowObj)) {
+    return false;
+  }
+
   const imported = toBoolean_(rowObj['取込済み']);
 
   if (imported) {
@@ -361,6 +365,40 @@ function isCommitTarget_(rowObj) {
   const status = normalizeText_(rowObj['確認ステータス']);
 
   return approved || status === '確認済み';
+}
+
+/**
+ * TOTALS行、合計行、チーム合計行を判定する。
+ */
+function isTotalsRow_(rowObj) {
+  const values = [
+    rowObj.PlayerNo,
+    rowObj.PlayerID,
+    rowObj.No,
+    rowObj['No.'],
+    rowObj.Name,
+    rowObj.PlayerName,
+    rowObj.DisplayName,
+    rowObj['名前'],
+    rowObj['選手名']
+  ];
+
+  for (let i = 0; i < values.length; i++) {
+    const text = normalizeText_(values[i]).toUpperCase();
+
+    if (
+      text === 'TOTALS' ||
+      text === 'TOTAL' ||
+      text === 'TEAM TOTALS' ||
+      text === 'TEAM TOTAL' ||
+      text === '合計' ||
+      text === 'チーム合計'
+    ) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 /**
@@ -416,9 +454,9 @@ function validateImportRow_(rowObj, context) {
 
 /**
  * PlayerStatsへ書き込む1行分のオブジェクトを作る。
- * PlayerStats.SeasonID / GameID / PlayerID は明示的に正式値を書き込む。
+ * PlayerStats.SeasonID / GameID / PlayerID は対象行の値と正式IDを明示的に書き込む。
  */
-function buildPlayerStatsRow_(importRow, statsHeaders, resolvedPlayerId, normalizedGameId) {
+function buildPlayerStatsRow_(importRow, statsHeaders, resolvedPlayerId) {
   const row = {};
 
   statsHeaders.forEach(function(header) {
@@ -437,7 +475,7 @@ function buildPlayerStatsRow_(importRow, statsHeaders, resolvedPlayerId, normali
     }
 
     if (header === 'GameID') {
-      row[header] = normalizeGameId_(normalizedGameId);
+      row[header] = normalizeGameId_(importRow.GameID);
       return;
     }
 
