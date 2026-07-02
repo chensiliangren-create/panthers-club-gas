@@ -348,6 +348,132 @@ function approveAndCommitPlayerStatsImport() {
 }
 
 /**
+ * PlayerStatsからTeamGameSummaryを再集計する。
+ */
+function recalcTeamGameSummary(gameId) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const statsSheet = getRequiredSheet_(ss, 'PlayerStats');
+  const summarySheet = getRequiredSheet_(ss, 'TeamGameSummary');
+
+  const targetGameId = normalizeGameId_(gameId);
+
+  if (!targetGameId) {
+    throw new Error('GameID が空です。');
+  }
+
+  const statsData = readSheetObjects_(statsSheet);
+  const targetRows = statsData.rows.filter(function(row) {
+    return normalizeGameId_(row.GameID) === targetGameId &&
+      normalizeText_(row.PlayerID) !== '' &&
+      !isTotalsRow_(row);
+  });
+
+  if (targetRows.length === 0) {
+    throw new Error('指定GameIDのPlayerStatsが見つかりません: ' + targetGameId);
+  }
+
+  const seasonId = normalizeText_(targetRows[0].SeasonID);
+
+  if (!seasonId) {
+    throw new Error('対象PlayerStatsのSeasonIDが空です: ' + targetGameId);
+  }
+
+  const totals = {
+    PTS: 0,
+    '3P/M': 0,
+    '3P/A': 0,
+    '2P/M': 0,
+    '2P/A': 0,
+    'FT/M': 0,
+    'FT/A': 0,
+    OREB: 0,
+    DREB: 0,
+    TOTREB: 0,
+    AST: 0,
+    TO: 0,
+    STL: 0,
+    BLK: 0,
+    PF: 0,
+    FGA: 0,
+    FGM: 0
+  };
+
+  targetRows.forEach(function(row) {
+    totals.PTS += toNumber_(row.PTS);
+    totals['3P/M'] += toNumber_(row['3P/M']);
+    totals['3P/A'] += toNumber_(row['3P/A']);
+    totals['2P/M'] += toNumber_(row['2P/M']);
+    totals['2P/A'] += toNumber_(row['2P/A']);
+    totals['FT/M'] += toNumber_(row['FT/M']);
+    totals['FT/A'] += toNumber_(row['FT/A']);
+    totals.OREB += toNumber_(row.OREB);
+    totals.DREB += toNumber_(row.DREB);
+    totals.TOTREB += toNumber_(row.TOTREB);
+    totals.AST += toNumber_(row.AST);
+    totals.TO += toNumber_(row.TO);
+    totals.STL += toNumber_(row.STL);
+    totals.BLK += toNumber_(row.BLK);
+    totals.PF += toNumber_(row.PF);
+  });
+
+  totals.FGA = totals['3P/A'] + totals['2P/A'];
+  totals.FGM = totals['3P/M'] + totals['2P/M'];
+
+  const poss = totals.FGA + 0.44 * totals['FT/A'] + totals.TO - totals.OREB;
+
+  const summaryValues = {
+    TeamGameSummaryID: 'TGS_' + seasonId + '_' + targetGameId,
+    SeasonID: seasonId,
+    GameID: targetGameId,
+    PTS: round1_(totals.PTS),
+    '3P/M': round1_(totals['3P/M']),
+    '3P/A': round1_(totals['3P/A']),
+    '3P%': safePercent_(totals['3P/M'], totals['3P/A']),
+    '2P/M': round1_(totals['2P/M']),
+    '2P/A': round1_(totals['2P/A']),
+    '2P%': safePercent_(totals['2P/M'], totals['2P/A']),
+    'FT/M': round1_(totals['FT/M']),
+    'FT/A': round1_(totals['FT/A']),
+    'FT%': safePercent_(totals['FT/M'], totals['FT/A']),
+    'eFG%': safeDivide_(totals.FGM + 0.5 * totals['3P/M'], totals.FGA, 100),
+    OREB: round1_(totals.OREB),
+    DREB: round1_(totals.DREB),
+    TOTREB: round1_(totals.TOTREB),
+    AST: round1_(totals.AST),
+    TO: round1_(totals.TO),
+    STL: round1_(totals.STL),
+    BLK: round1_(totals.BLK),
+    PF: round1_(totals.PF),
+    FGA: round1_(totals.FGA),
+    FGM: round1_(totals.FGM),
+    Poss: round1_(poss),
+    PPP: safeDivide_(totals.PTS, poss, 1),
+    'TO%': safeDivide_(totals.TO, poss, 100),
+    FTR: safeDivide_(totals['FT/A'], totals.FGA, 100),
+    'AST/TO': safeDivide_(totals.AST, totals.TO, 1)
+  };
+
+  const summaryData = readSheetObjects_(summarySheet);
+  const headerMapAll = getHeaderMapAll_(summarySheet);
+  let updated = false;
+
+  for (let i = 0; i < summaryData.rows.length; i++) {
+    if (normalizeGameId_(summaryData.rows[i].GameID) === targetGameId) {
+      const rowNumber = summaryData.startRow + i;
+      setRowValuesByHeaderAll_(summarySheet, headerMapAll, rowNumber, summaryValues);
+      updated = true;
+      break;
+    }
+  }
+
+  if (!updated) {
+    appendByHeader_(summarySheet, summaryValues);
+  }
+
+  Logger.log('TeamGameSummary再集計 完了: ' + targetGameId);
+}
+
+/**
  * 正式反映対象行かどうかを判定する。
  */
 function isCommitTarget_(rowObj) {
@@ -745,6 +871,45 @@ function setRowValuesByHeader_(sheet, headerMap, rowNumber, values) {
 }
 
 /**
+ * 重複ヘッダーを含めて、ヘッダー名 -> 列番号配列 のMapを取得する。
+ */
+function getHeaderMapAll_(sheet) {
+  const headers = getHeaders_(sheet);
+  const map = {};
+
+  headers.forEach(function(header, index) {
+    if (!header) {
+      return;
+    }
+
+    if (!map[header]) {
+      map[header] = [];
+    }
+
+    map[header].push(index + 1);
+  });
+
+  return map;
+}
+
+/**
+ * 重複ヘッダーを含めて、指定行の複数列を更新する。
+ */
+function setRowValuesByHeaderAll_(sheet, headerMapAll, rowNumber, values) {
+  Object.keys(values).forEach(function(header) {
+    const columns = headerMapAll[header];
+
+    if (!columns || columns.length === 0) {
+      return;
+    }
+
+    columns.forEach(function(column) {
+      sheet.getRange(rowNumber, column).setValue(values[header]);
+    });
+  });
+}
+
+/**
  * 必要列がなければ末尾に追加する。
  */
 function ensureColumns_(sheet, requiredHeaders) {
@@ -912,6 +1077,51 @@ function normalizeGameId_(value) {
   }
 
   return text.replace(/^GANE/, 'GAME');
+}
+
+/**
+ * 数値化する。
+ */
+function toNumber_(value) {
+  if (value === null || value === undefined || value === '') {
+    return 0;
+  }
+
+  const numberValue = Number(String(value).replace(/,/g, ''));
+
+  if (isNaN(numberValue)) {
+    return 0;
+  }
+
+  return numberValue;
+}
+
+/**
+ * 小数1桁に丸める。
+ */
+function round1_(value) {
+  const numberValue = toNumber_(value);
+  return Math.round(numberValue * 10) / 10;
+}
+
+/**
+ * 0除算を避けて比率を計算する。
+ */
+function safeDivide_(numerator, denominator, multiplier) {
+  const den = toNumber_(denominator);
+
+  if (den === 0) {
+    return 0;
+  }
+
+  return round1_(toNumber_(numerator) / den * multiplier);
+}
+
+/**
+ * 0除算を避けて百分率を計算する。
+ */
+function safePercent_(numerator, denominator) {
+  return safeDivide_(numerator, denominator, 100);
 }
 
 /**
