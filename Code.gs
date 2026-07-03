@@ -156,19 +156,31 @@ function analyzeStatsWithGemini(pdfBlob) {
  * Geminiのテキスト応答からJSONを取り出す。
  */
 function parseGeminiResponse(rawText) {
-  try {
-    const jsonString = String(rawText || '')
-      .replace(/```json/g, '')
-      .replace(/```/g, '')
-      .trim();
+  Logger.log(rawText);
 
-    return JSON.parse(jsonString);
+  try {
+    let text = String(rawText || '').trim();
+
+    // ```json ... ``` がある場合は中身だけ抜く
+    const codeBlockMatch = text.match(/```json\s*([\s\S]*?)```/i);
+    if (codeBlockMatch && codeBlockMatch[1]) {
+      text = codeBlockMatch[1].trim();
+    } else {
+      // 念のため、最初の [ から最後の ] までを抜く
+      const start = text.indexOf('[');
+      const end = text.lastIndexOf(']');
+      if (start >= 0 && end > start) {
+        text = text.substring(start, end + 1);
+      }
+    }
+
+    return JSON.parse(text);
+
   } catch (e) {
     Logger.log('Gemini応答のJSON解析に失敗しました: ' + e.message);
     return null;
   }
 }
-
 /**
  * テスト用。
  */
@@ -216,6 +228,7 @@ function approveAndCommitPlayerStatsImport() {
   let targetCount = 0;
   let successCount = 0;
   let errorCount = 0;
+  const affectedGameIds = new Set();
 
   try {
     const importData = readSheetObjects_(importSheet);
@@ -275,6 +288,7 @@ function approveAndCommitPlayerStatsImport() {
           反映エラー: ''
         });
 
+affectedGameIds.add(gameId);
         successCount++;
       } catch (e) {
         errorCount++;
@@ -304,6 +318,9 @@ function approveAndCommitPlayerStatsImport() {
       }
     });
 
+affectedGameIds.forEach(function(gameId) {
+  recalcTeamGameSummary(gameId);
+});
     updateImportBatch_(batchSheet, batchId, {
       終了日時: new Date(),
       ステータス: errorCount > 0 ? '一部エラー' : '完了',
@@ -1150,6 +1167,18 @@ function createImportError_(errorCode, message) {
   error.errorCode = errorCode;
   return error;
 }
-  function testRecalcTeamGameSummary_GAME0604() {
-  recalcTeamGameSummary('GAME0604');
+  function testRecalcTeamGameSummary_GAME0603() {
+  recalcTeamGameSummary('GAME0603');
+}
+function testProcessStatsUpload_GAME0603() {
+  const folders = DriveApp.getFoldersByName('Panthers_Stats_Upload');
+  const folder = folders.next();
+  const file = folder.getFilesByName('20260603vs大阪商業大学.pdf').next();
+  processStatsUpload(file.getBlob(), 'GAME0603');
+}
+function testProcessStatsUpload_GAME0524() {
+  const folders = DriveApp.getFoldersByName('Panthers_Stats_Upload');
+  const folder = folders.next();
+  const file = folder.getFilesByName('20260524vsLakeBlue.pdf').next();
+  processStatsUpload(file.getBlob(), 'GAME0524');
 }
