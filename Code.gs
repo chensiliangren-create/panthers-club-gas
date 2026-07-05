@@ -3,6 +3,88 @@
  * PDF取込 + Gemini解析 + PlayerStats_Import正式反映 完全版
  */
 
+const STATS_UPLOAD_FOLDER_NAME = 'Panthers_Stats_Upload';
+const GEMINI_MODEL_NAME = 'gemini-2.5-flash';
+const GEMINI_MAX_RETRIES = 3;
+const GEMINI_RETRY_SLEEP_MS = 2000;
+
+/**
+ * Driveフォルダ内のPDFから、未処理または最新の試合PDFを1件選んで取り込む。
+ */
+function processLatestStatsPdf() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const folder = getStatsUploadFolder_();
+  const games = getGameMasterRows_(ss)
+    .filter(function(game) {
+      return game.GameID && game.試合日;
+    })
+    .sort(function(a, b) {
+      return getDateValue_(b.試合日) - getDateValue_(a.試合日);
+    });
+
+  if (games.length === 0) {
+    throw new Error('GameMasterに有効な試合情報がありません。');
+  }
+
+  const processedGameIds = getProcessedGameIdSet_(ss);
+  const candidates = [];
+
+  games.forEach(function(game) {
+    const file = findPdfFileForGame_(folder, game);
+
+    if (file) {
+      candidates.push({
+        game: game,
+        file: file,
+        processed: processedGameIds.has(normalizeGameId_(game.GameID))
+      });
+    }
+  });
+
+  if (candidates.length === 0) {
+    throw new Error('Panthers_Stats_Upload内にGameMasterと照合できるPDFが見つかりません。');
+  }
+
+  const unprocessed = candidates.filter(function(candidate) {
+    return !candidate.processed;
+  });
+
+  const selected = unprocessed.length > 0 ? unprocessed[0] : candidates[0];
+
+  if (!selected || !selected.game || !selected.file) {
+    throw new Error('処理対象PDFを特定できませんでした。');
+  }
+
+  processStatsUpload(selected.file.getBlob(), selected.game.GameID);
+}
+
+/**
+ * 指定GameIDに対応するPDFをDriveフォルダから探して取り込む。
+ */
+function processStatsPdfByGameId(gameId) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const folder = getStatsUploadFolder_();
+  const targetGameId = normalizeGameId_(gameId);
+
+  if (!targetGameId) {
+    throw new Error('GameIDが空です。');
+  }
+
+  const game = getGameByGameId_(ss, targetGameId);
+
+  if (!game) {
+    throw new Error('GameMasterにGameIDが見つかりません: ' + targetGameId);
+  }
+
+  const file = findPdfFileForGame_(folder, game);
+
+  if (!file) {
+    throw new Error('GameIDに対応するPDFが見つかりません: ' + targetGameId);
+  }
+
+  processStatsUpload(file.getBlob(), targetGameId);
+}
+
 /**
  * PDFスタッツをGeminiで解析し、PlayerStats_Importへ書き込む。
  */
@@ -32,63 +114,66 @@ function writeToSheet(statsData, gameId) {
     return;
   }
 
-  ensureColumns_(sheet, [
-    'SeasonID',
-    'GameID',
-    'PlayerNo',
-    '確認ステータス',
-    '承認',
-    '取込済み',
-    'ImportBatchID',
-    '反映日時',
-    '反映エラー'
-  ]);
-
   const headers = getHeaders_(sheet);
-  const seasonId = getActiveSeasonId_(ss);
+  const seasonId = getSeasonIdForGame_(ss, gameId) || getActiveSeasonId_(ss);
 
-  const rows = statsData.map(function(p) {
-    const rowObj = {};
+  const rows = statsData
+    .filter(function(p) {
+      return !isTotalsRow_(p);
+    })
+    .map(function(p) {
+      const rowObj = {};
 
-    rowObj.SeasonID = seasonId;
-    rowObj.GameID = normalizeGameId_(gameId);
-    rowObj.PlayerNo = p.PlayerNo || p.PlayerID || p.No || p['No.'] || '';
-    rowObj.GS = p.GS || 0;
-    rowObj.PTS = p.PTS || 0;
-    rowObj['eFG%'] = p['eFG%'] || 0;
-    rowObj['3P/M'] = p['3P/M'] || 0;
-    rowObj['3P/A'] = p['3P/A'] || 0;
-    rowObj['3P%'] = p['3P%'] || 0;
-    rowObj['2P/M'] = p['2P/M'] || 0;
-    rowObj['2P/A'] = p['2P/A'] || 0;
-    rowObj['2P%'] = p['2P%'] || 0;
-    rowObj['FT/M'] = p['FT/M'] || 0;
-    rowObj['FT/A'] = p['FT/A'] || 0;
-    rowObj['FT%'] = p['FT%'] || 0;
-    rowObj.OREB = p.OREB || 0;
-    rowObj.DREB = p.DREB || 0;
-    rowObj.TOTREB = p.TOTREB || 0;
-    rowObj.AST = p.AST || 0;
-    rowObj.STL = p.STL || 0;
-    rowObj.BLK = p.BLK || 0;
-    rowObj.TO = p.TO || 0;
-    rowObj.PF = p.PF || 0;
-    rowObj.TF = p.TF || 0;
-    rowObj.OF = p.OF || 0;
-    rowObj.MIN = p.MIN || 0;
-    rowObj['+/-'] = p['+/-'] || p['±'] || p['ﾂｱ'] || 0;
-    rowObj.PPP = p.PPP || 0;
-    rowObj['TO%'] = p['TO%'] || 0;
-    rowObj['OREB%'] = p['OREB%'] || 0;
-    rowObj.FTR = p.FTR || 0;
-    rowObj['確認ステータス'] = '未確認';
-    rowObj['承認'] = false;
-    rowObj['取込済み'] = false;
+      rowObj.PlayerStats = '';
+      rowObj.SeasonID = seasonId;
+      rowObj.GameID = normalizeGameId_(gameId);
+      rowObj.PlayerNo = p.PlayerNo || p.PlayerID || p.No || p['No.'] || '';
+      rowObj.GS = p.GS || 0;
+      rowObj.PTS = p.PTS || 0;
+      rowObj['eFG%'] = p['eFG%'] || 0;
+      rowObj['3P/M'] = p['3P/M'] || 0;
+      rowObj['3P/A'] = p['3P/A'] || 0;
+      rowObj['3P%'] = p['3P%'] || 0;
+      rowObj['2P/M'] = p['2P/M'] || 0;
+      rowObj['2P/A'] = p['2P/A'] || 0;
+      rowObj['2P%'] = p['2P%'] || 0;
+      rowObj['FT/M'] = p['FT/M'] || 0;
+      rowObj['FT/A'] = p['FT/A'] || 0;
+      rowObj['FT%'] = p['FT%'] || 0;
+      rowObj.OREB = p.OREB || 0;
+      rowObj.DREB = p.DREB || 0;
+      rowObj.TOTREB = p.TOTREB || 0;
+      rowObj.AST = p.AST || 0;
+      rowObj.STL = p.STL || 0;
+      rowObj.BLK = p.BLK || 0;
+      rowObj.TO = p.TO || 0;
+      rowObj.PF = p.PF || 0;
+      rowObj.TF = p.TF || 0;
+      rowObj.OF = p.OF || 0;
+      rowObj.MIN = p.MIN || 0;
+      rowObj['+/-'] = p['+/-'] || p['±'] || p['ﾂｱ'] || 0;
+      rowObj.PPP = p.PPP || 0;
+      rowObj['TO%'] = p['TO%'] || 0;
+      rowObj['OREB%'] = p['OREB%'] || 0;
+      rowObj.FTR = p.FTR || 0;
+      rowObj['確認ステータス'] = '未確認';
+      rowObj['確認者'] = '';
+      rowObj['確認日時'] = '';
+      rowObj['取込済み'] = false;
+      rowObj['承認'] = false;
+      rowObj.ImportBatchID = '';
+      rowObj['反映日時'] = '';
+      rowObj['反映エラー'] = '';
 
-    return headers.map(function(header) {
-      return Object.prototype.hasOwnProperty.call(rowObj, header) ? rowObj[header] : '';
+      return headers.map(function(header) {
+        return Object.prototype.hasOwnProperty.call(rowObj, header) ? rowObj[header] : '';
+      });
     });
-  });
+
+  if (rows.length === 0) {
+    Logger.log('TOTALS行以外の書き込み対象データがありません。');
+    return;
+  }
 
   sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, headers.length).setValues(rows);
   Logger.log('成功: ' + rows.length + '件のデータをPlayerStats_Importへ書き込みました。');
@@ -104,14 +189,14 @@ function analyzeStatsWithGemini(pdfBlob) {
     throw new Error('GEMINI_API_KEY がスクリプトプロパティに設定されていません。');
   }
 
-  const url = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=' + apiKey;
+  const url = 'https://generativelanguage.googleapis.com/v1beta/models/' + GEMINI_MODEL_NAME + ':generateContent?key=' + apiKey;
   const base64Data = Utilities.base64Encode(pdfBlob.getBytes());
 
   const payload = {
     contents: [{
       parts: [
         {
-          text: 'PDFの統計表から、以下のキー名でJSON配列として抽出してください。PlayerNoは背番号です。PlayerIDではありません。TOTALS行、合計行、チーム合計行は除外してください。キー: PlayerNo, GS, PTS, eFG%, 3P/M, 3P/A, 3P%, 2P/M, 2P/A, 2P%, FT/M, FT/A, FT%, OREB, DREB, TOTREB, AST, STL, BLK, TO, PF, TF, OF, MIN, +/-, PPP, TO%, OREB%, FTR'
+          text: 'PDFの統計表から、個人スタッツだけをJSON配列として抽出してください。説明文は不要です。PlayerNoは背番号です。PlayerIDではありません。TOTALS行、TOTAL行、合計行、チーム合計行は除外してください。数値は数値として返してください。キー: PlayerNo, GS, PTS, eFG%, 3P/M, 3P/A, 3P%, 2P/M, 2P/A, 2P%, FT/M, FT/A, FT%, OREB, DREB, TOTREB, AST, STL, BLK, TO, PF, TF, OF, MIN, +/-, PPP, TO%, OREB%, FTR'
         },
         {
           inline_data: {
@@ -123,37 +208,52 @@ function analyzeStatsWithGemini(pdfBlob) {
     }]
   };
 
-  const res = UrlFetchApp.fetch(url, {
-    method: 'post',
-    contentType: 'application/json',
-    payload: JSON.stringify(payload),
-    muteHttpExceptions: true
-  });
+  let lastError = null;
 
-  const statusCode = res.getResponseCode();
-  const responseText = res.getContentText();
+  for (let attempt = 1; attempt <= GEMINI_MAX_RETRIES; attempt++) {
+    const res = UrlFetchApp.fetch(url, {
+      method: 'post',
+      contentType: 'application/json',
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true
+    });
 
-  if (statusCode < 200 || statusCode >= 300) {
-    throw new Error('Gemini APIエラー: HTTP ' + statusCode + ' / ' + responseText);
+    const statusCode = res.getResponseCode();
+    const responseText = res.getContentText();
+
+    if (statusCode >= 200 && statusCode < 300) {
+      const json = JSON.parse(responseText);
+
+      if (
+        !json.candidates ||
+        !json.candidates[0] ||
+        !json.candidates[0].content ||
+        !json.candidates[0].content.parts ||
+        !json.candidates[0].content.parts[0]
+      ) {
+        throw new Error('Gemini APIの応答形式が想定外です: ' + responseText);
+      }
+
+      return json.candidates[0].content.parts[0].text;
+    }
+
+    lastError = new Error('Gemini APIエラー: HTTP ' + statusCode + ' / ' + responseText);
+
+    if (statusCode === 503 || statusCode === 429 || statusCode >= 500) {
+      if (attempt < GEMINI_MAX_RETRIES) {
+        Utilities.sleep(GEMINI_RETRY_SLEEP_MS * attempt);
+        continue;
+      }
+    }
+
+    throw lastError;
   }
 
-  const json = JSON.parse(responseText);
-
-  if (
-    !json.candidates ||
-    !json.candidates[0] ||
-    !json.candidates[0].content ||
-    !json.candidates[0].content.parts ||
-    !json.candidates[0].content.parts[0]
-  ) {
-    throw new Error('Gemini APIの応答形式が想定外です: ' + responseText);
-  }
-
-  return json.candidates[0].content.parts[0].text;
+  throw lastError || new Error('Gemini APIエラー: 不明なエラー');
 }
 
 /**
- * Geminiのテキスト応答からJSONを取り出す。
+ * Geminiのテキスト応答からJSON配列を取り出す。
  */
 function parseGeminiResponse(rawText) {
   Logger.log(rawText);
@@ -161,12 +261,10 @@ function parseGeminiResponse(rawText) {
   try {
     let text = String(rawText || '').trim();
 
-    // ```json ... ``` がある場合は中身だけ抜く
-    const codeBlockMatch = text.match(/```json\s*([\s\S]*?)```/i);
+    const codeBlockMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
     if (codeBlockMatch && codeBlockMatch[1]) {
       text = codeBlockMatch[1].trim();
     } else {
-      // 念のため、最初の [ から最後の ] までを抜く
       const start = text.indexOf('[');
       const end = text.lastIndexOf(']');
       if (start >= 0 && end > start) {
@@ -174,24 +272,30 @@ function parseGeminiResponse(rawText) {
       }
     }
 
-    return JSON.parse(text);
+    const parsed = JSON.parse(text);
 
+    if (!Array.isArray(parsed)) {
+      return null;
+    }
+
+    return parsed.filter(function(row) {
+      return !isTotalsRow_(row);
+    });
   } catch (e) {
     Logger.log('Gemini応答のJSON解析に失敗しました: ' + e.message);
     return null;
   }
 }
+
 /**
  * テスト用。
  */
 function testProcess() {
-  const folder = DriveApp.getFoldersByName('Panthers_Stats_Upload').next();
-  const file = folder.getFilesByName('20260613vs明治大学.pdf').next();
-  processStatsUpload(file.getBlob(), 'GAME0613');
+  processStatsPdfByGameId('GAME0613');
 }
 
 /**
- * PlayerStats_ImportからPlayerStatsへ正式反映する。
+ * PlayerStats_ImportからPlayerStatsへ正式反映し、反映したGameIDのTeamGameSummaryを再集計する。
  */
 function approveAndCommitPlayerStatsImport() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -201,15 +305,8 @@ function approveAndCommitPlayerStatsImport() {
   const playerSheet = getRequiredSheet_(ss, 'PlayerMaster');
   const gameSheet = getRequiredSheet_(ss, 'GameMaster');
   const seasonSheet = getRequiredSheet_(ss, 'SeasonMaster');
-
-  const batchSheet = getOrCreateImportBatchSheet_(ss);
-  const errorSheet = getOrCreateImportErrorLogSheet_(ss);
-
-  ensureColumns_(importSheet, [
-    'ImportBatchID',
-    '反映日時',
-    '反映エラー'
-  ]);
+  const batchSheet = getRequiredSheet_(ss, 'ImportBatch');
+  const errorSheet = getRequiredSheet_(ss, 'ImportErrorLog');
 
   const batchId = createId_('BATCH');
 
@@ -288,7 +385,7 @@ function approveAndCommitPlayerStatsImport() {
           反映エラー: ''
         });
 
-affectedGameIds.add(gameId);
+        affectedGameIds.add(gameId);
         successCount++;
       } catch (e) {
         errorCount++;
@@ -318,16 +415,17 @@ affectedGameIds.add(gameId);
       }
     });
 
-affectedGameIds.forEach(function(gameId) {
-  recalcTeamGameSummary(gameId);
-});
+    affectedGameIds.forEach(function(gameId) {
+      recalcTeamGameSummary(gameId);
+    });
+
     updateImportBatch_(batchSheet, batchId, {
       終了日時: new Date(),
       ステータス: errorCount > 0 ? '一部エラー' : '完了',
       対象件数: targetCount,
       成功件数: successCount,
       エラー件数: errorCount,
-      メモ: ''
+      メモ: affectedGameIds.size > 0 ? '再集計GameID: ' + Array.from(affectedGameIds).join(', ') : ''
     });
 
     Logger.log(
@@ -377,7 +475,6 @@ function recalcTeamGameSummary(gameId) {
   if (!targetGameId) {
     throw new Error('GameID が空です。');
   }
-
 
   const statsData = readSheetObjects_(statsSheet);
   const targetRows = statsData.rows.filter(function(row) {
@@ -598,7 +695,6 @@ function validateImportRow_(rowObj, context) {
 
 /**
  * PlayerStatsへ書き込む1行分のオブジェクトを作る。
- * PlayerStats.SeasonID / GameID / PlayerID は対象行の値と正式IDを明示的に書き込む。
  */
 function buildPlayerStatsRow_(importRow, statsHeaders, resolvedPlayerId) {
   const row = {};
@@ -634,6 +730,8 @@ function buildPlayerStatsRow_(importRow, statsHeaders, resolvedPlayerId) {
 
     if (
       header === '確認ステータス' ||
+      header === '確認者' ||
+      header === '確認日時' ||
       header === '承認' ||
       header === '取込済み' ||
       header === 'ImportBatchID' ||
@@ -746,86 +844,6 @@ function updateImportRowError_(sheet, headerMap, rowNumber, values) {
 }
 
 /**
- * ImportBatchシートを作成または取得する。
- */
-function getOrCreateImportBatchSheet_(ss) {
-  const sheetName = 'ImportBatch';
-  let sheet = ss.getSheetByName(sheetName);
-
-  if (!sheet) {
-    sheet = ss.insertSheet(sheetName);
-    sheet.getRange(1, 1, 1, 9).setValues([[
-      'ImportBatchID',
-      '処理種別',
-      '開始日時',
-      '終了日時',
-      'ステータス',
-      '対象件数',
-      '成功件数',
-      'エラー件数',
-      'メモ'
-    ]]);
-  } else {
-    ensureColumns_(sheet, [
-      'ImportBatchID',
-      '処理種別',
-      '開始日時',
-      '終了日時',
-      'ステータス',
-      '対象件数',
-      '成功件数',
-      'エラー件数',
-      'メモ'
-    ]);
-  }
-
-  return sheet;
-}
-
-/**
- * ImportErrorLogシートを作成または取得する。
- */
-function getOrCreateImportErrorLogSheet_(ss) {
-  const sheetName = 'ImportErrorLog';
-  let sheet = ss.getSheetByName(sheetName);
-
-  if (!sheet) {
-    sheet = ss.insertSheet(sheetName);
-    sheet.getRange(1, 1, 1, 12).setValues([[
-      'ErrorID',
-      'ImportBatchID',
-      '発生日時',
-      'シート名',
-      '行番号',
-      'ErrorCode',
-      'ErrorMessage',
-      'SeasonID',
-      'GameID',
-      'PlayerID',
-      'PlayerNo',
-      'RawData'
-    ]]);
-  } else {
-    ensureColumns_(sheet, [
-      'ErrorID',
-      'ImportBatchID',
-      '発生日時',
-      'シート名',
-      '行番号',
-      'ErrorCode',
-      'ErrorMessage',
-      'SeasonID',
-      'GameID',
-      'PlayerID',
-      'PlayerNo',
-      'RawData'
-    ]);
-  }
-
-  return sheet;
-}
-
-/**
  * ImportBatchの該当行を更新する。
  */
 function updateImportBatch_(batchSheet, batchId, values) {
@@ -924,22 +942,6 @@ function setRowValuesByHeaderAll_(sheet, headerMapAll, rowNumber, values) {
     columns.forEach(function(column) {
       sheet.getRange(rowNumber, column).setValue(values[header]);
     });
-  });
-}
-
-/**
- * 必要列がなければ末尾に追加する。
- */
-function ensureColumns_(sheet, requiredHeaders) {
-  const headers = getHeaders_(sheet);
-  let currentLastColumn = headers.length;
-
-  requiredHeaders.forEach(function(header) {
-    if (headers.indexOf(header) === -1) {
-      currentLastColumn++;
-      sheet.getRange(1, currentLastColumn).setValue(header);
-      headers.push(header);
-    }
   });
 }
 
@@ -1055,6 +1057,213 @@ function getActiveSeasonId_(ss) {
 }
 
 /**
+ * GameIDに対応するSeasonIDをGameMasterから取得する。
+ */
+function getSeasonIdForGame_(ss, gameId) {
+  const game = getGameByGameId_(ss, gameId);
+  return game ? normalizeText_(game.SeasonID) : '';
+}
+
+/**
+ * GameMasterからGameID指定で1行取得する。
+ */
+function getGameByGameId_(ss, gameId) {
+  const targetGameId = normalizeGameId_(gameId);
+  const games = getGameMasterRows_(ss);
+
+  for (let i = 0; i < games.length; i++) {
+    if (normalizeGameId_(games[i].GameID) === targetGameId) {
+      return games[i];
+    }
+  }
+
+  return null;
+}
+
+/**
+ * GameMasterを読み込む。
+ */
+function getGameMasterRows_(ss) {
+  const sheet = getRequiredSheet_(ss, 'GameMaster');
+  const data = readSheetObjects_(sheet);
+
+  return data.rows.map(function(row) {
+    row.GameID = normalizeGameId_(row.GameID);
+    return row;
+  });
+}
+
+/**
+ * 処理済みGameIDを取得する。
+ */
+function getProcessedGameIdSet_(ss) {
+  const set = new Set();
+
+  const importSheet = ss.getSheetByName('PlayerStats_Import');
+  if (importSheet) {
+    const importData = readSheetObjects_(importSheet);
+    importData.rows.forEach(function(row) {
+      const gameId = normalizeGameId_(row.GameID);
+      if (gameId) {
+        set.add(gameId);
+      }
+    });
+  }
+
+  const statsSheet = ss.getSheetByName('PlayerStats');
+  if (statsSheet) {
+    const statsData = readSheetObjects_(statsSheet);
+    statsData.rows.forEach(function(row) {
+      const gameId = normalizeGameId_(row.GameID);
+      if (gameId) {
+        set.add(gameId);
+      }
+    });
+  }
+
+  return set;
+}
+
+/**
+ * PDFアップロードフォルダを取得する。
+ */
+function getStatsUploadFolder_() {
+  const folders = DriveApp.getFoldersByName(STATS_UPLOAD_FOLDER_NAME);
+
+  if (!folders.hasNext()) {
+    throw new Error('Driveフォルダが見つかりません: ' + STATS_UPLOAD_FOLDER_NAME);
+  }
+
+  return folders.next();
+}
+
+/**
+ * GameMasterの試合情報に対応するPDFを探す。
+ */
+function findPdfFileForGame_(folder, game) {
+  const files = folder.getFiles();
+  const gameId = normalizeGameId_(game.GameID);
+  const ymd = formatGameDateYmd_(game.試合日);
+  const opponent = normalizeFileToken_(game.対戦相手);
+  const displayGame = normalizeFileToken_(game.DisplayGame);
+
+  let fallback = null;
+
+  while (files.hasNext()) {
+    const file = files.next();
+    const name = file.getName();
+    const lower = name.toLowerCase();
+
+    if (lower.indexOf('.pdf') === -1) {
+      continue;
+    }
+
+    const normalizedName = normalizeFileToken_(name);
+
+    if (gameId && normalizedName.indexOf(normalizeFileToken_(gameId)) >= 0) {
+      return file;
+    }
+
+    if (ymd && normalizedName.indexOf(ymd) >= 0) {
+      if (opponent && normalizedName.indexOf(opponent) >= 0) {
+        return file;
+      }
+
+      if (displayGame && hasAnyDisplayGameToken_(normalizedName, displayGame)) {
+        return file;
+      }
+
+      if (!fallback) {
+        fallback = file;
+      }
+    }
+  }
+
+  return fallback;
+}
+
+/**
+ * DisplayGame由来の一部トークンがファイル名に含まれるか判定する。
+ */
+function hasAnyDisplayGameToken_(normalizedName, displayGame) {
+  const tokens = String(displayGame || '')
+    .split(/[^0-9A-Z\u3040-\u30ff\u3400-\u9fff]+/i)
+    .filter(function(token) {
+      return token && token.length >= 2;
+    });
+
+  for (let i = 0; i < tokens.length; i++) {
+    if (normalizedName.indexOf(tokens[i]) >= 0) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * ファイル名照合用に文字列を正規化する。
+ */
+function normalizeFileToken_(value) {
+  return normalizeText_(value)
+    .toUpperCase()
+    .replace(/\s+/g, '')
+    .replace(/[._\-ー―‐/\\:：()（）\[\]【】]/g, '');
+}
+
+/**
+ * 試合日をyyyyMMddへ変換する。
+ */
+function formatGameDateYmd_(value) {
+  if (!value) {
+    return '';
+  }
+
+  if (Object.prototype.toString.call(value) === '[object Date]' && !isNaN(value.getTime())) {
+    return Utilities.formatDate(value, Session.getScriptTimeZone(), 'yyyyMMdd');
+  }
+
+  const text = normalizeText_(value);
+
+  if (/^\d{8}$/.test(text)) {
+    return text;
+  }
+
+  const compact = text.replace(/[^\d]/g, '');
+
+  if (compact.length >= 8) {
+    return compact.substring(0, 8);
+  }
+
+  return '';
+}
+
+/**
+ * 日付比較用の値を取得する。
+ */
+function getDateValue_(value) {
+  if (!value) {
+    return 0;
+  }
+
+  if (Object.prototype.toString.call(value) === '[object Date]' && !isNaN(value.getTime())) {
+    return value.getTime();
+  }
+
+  const ymd = formatGameDateYmd_(value);
+
+  if (!ymd) {
+    return 0;
+  }
+
+  const year = Number(ymd.substring(0, 4));
+  const month = Number(ymd.substring(4, 6)) - 1;
+  const day = Number(ymd.substring(6, 8));
+
+  return new Date(year, month, day).getTime();
+}
+
+/**
  * TRUE判定。
  */
 function toBoolean_(value) {
@@ -1167,18 +1376,27 @@ function createImportError_(errorCode, message) {
   error.errorCode = errorCode;
   return error;
 }
-  function testRecalcTeamGameSummary_GAME0603() {
+
+/**
+ * 既存互換テスト用。
+ */
+function testRecalcTeamGameSummary_GAME0603() {
   recalcTeamGameSummary('GAME0603');
 }
+
+/**
+ * 既存互換テスト用。
+ */
 function testProcessStatsUpload_GAME0603() {
-  const folders = DriveApp.getFoldersByName('Panthers_Stats_Upload');
-  const folder = folders.next();
-  const file = folder.getFilesByName('20260603vs大阪商業大学.pdf').next();
-  processStatsUpload(file.getBlob(), 'GAME0603');
+  processStatsPdfByGameId('GAME0603');
 }
+
+/**
+ * 既存互換テスト用。
+ */
 function testProcessStatsUpload_GAME0524() {
-  const folders = DriveApp.getFoldersByName('Panthers_Stats_Upload');
-  const folder = folders.next();
-  const file = folder.getFilesByName('20260524vsLakeBlue.pdf').next();
-  processStatsUpload(file.getBlob(), 'GAME0524');
+  processStatsPdfByGameId('GAME0524');
+}
+function testProcessStatsUpload_GAME0704() {
+  processStatsPdfByGameId('GAME0704');
 }
