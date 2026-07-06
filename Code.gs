@@ -1,6 +1,6 @@
 /**
  * Panthers Club Code.gs
- * PDF取込 + Gemini解析 + PlayerStats_Import正式反映 完全版
+ * PDF取込 + Gemini解析 + PlayerStats_Import正式反映 運用安定版
  */
 
 const STATS_UPLOAD_FOLDER_NAME = 'Panthers_Stats_Upload';
@@ -10,6 +10,7 @@ const GEMINI_RETRY_SLEEP_MS = 2000;
 
 /**
  * Driveフォルダ内のPDFから、未処理または最新の試合PDFを1件選んで取り込む。
+ * 誤選択防止のため、選択されたGameIDとPDF名を必ずログに出す。
  */
 function processLatestStatsPdf() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -55,6 +56,9 @@ function processLatestStatsPdf() {
     throw new Error('処理対象PDFを特定できませんでした。');
   }
 
+  Logger.log('processLatestStatsPdf 選択GameID: ' + normalizeGameId_(selected.game.GameID));
+  Logger.log('processLatestStatsPdf 選択PDF: ' + selected.file.getName());
+
   processStatsUpload(selected.file.getBlob(), selected.game.GameID);
 }
 
@@ -82,6 +86,9 @@ function processStatsPdfByGameId(gameId) {
     throw new Error('GameIDに対応するPDFが見つかりません: ' + targetGameId);
   }
 
+  Logger.log('processStatsPdfByGameId 対象GameID: ' + targetGameId);
+  Logger.log('processStatsPdfByGameId 対象PDF: ' + file.getName());
+
   processStatsUpload(file.getBlob(), targetGameId);
 }
 
@@ -104,6 +111,8 @@ function processStatsUpload(pdfBlob, gameIdRaw) {
 /**
  * Geminiの解析結果をPlayerStats_Importへ書き込む。
  * PlayerStats_Import.PlayerNo にはPDF由来の背番号を入れる。
+ * MINは分換算小数で保存する。例: 15:33 -> 15.55
+ * 表示上のmm:ssはAppSheet / Looker Studio側で対応し、DB側では計算しやすさを優先する。
  */
 function writeToSheet(statsData, gameId) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -130,16 +139,16 @@ function writeToSheet(statsData, gameId) {
       rowObj.PlayerNo = p.PlayerNo || p.PlayerID || p.No || p['No.'] || '';
       rowObj.GS = p.GS || 0;
       rowObj.PTS = p.PTS || 0;
-      rowObj['eFG%'] = p['eFG%'] || 0;
+      rowObj['eFG%'] = normalizePercent_(p['eFG%']);
       rowObj['3P/M'] = p['3P/M'] || 0;
       rowObj['3P/A'] = p['3P/A'] || 0;
-      rowObj['3P%'] = p['3P%'] || 0;
+      rowObj['3P%'] = normalizePercent_(p['3P%']);
       rowObj['2P/M'] = p['2P/M'] || 0;
       rowObj['2P/A'] = p['2P/A'] || 0;
-      rowObj['2P%'] = p['2P%'] || 0;
+      rowObj['2P%'] = normalizePercent_(p['2P%']);
       rowObj['FT/M'] = p['FT/M'] || 0;
       rowObj['FT/A'] = p['FT/A'] || 0;
-      rowObj['FT%'] = p['FT%'] || 0;
+      rowObj['FT%'] = normalizePercent_(p['FT%']);
       rowObj.OREB = p.OREB || 0;
       rowObj.DREB = p.DREB || 0;
       rowObj.TOTREB = p.TOTREB || 0;
@@ -150,12 +159,13 @@ function writeToSheet(statsData, gameId) {
       rowObj.PF = p.PF || 0;
       rowObj.TF = p.TF || 0;
       rowObj.OF = p.OF || 0;
-      rowObj.MIN = p.MIN || 0;
+      rowObj.MIN = normalizeMinutes_(p.MIN);
       rowObj['+/-'] = p['+/-'] || p['±'] || p['ﾂｱ'] || 0;
       rowObj.PPP = p.PPP || 0;
-      rowObj['TO%'] = p['TO%'] || 0;
-      rowObj['OREB%'] = p['OREB%'] || 0;
-      rowObj.FTR = p.FTR || 0;
+      rowObj['TO%'] = normalizePercent_(p['TO%']);
+      rowObj['OREB%'] = normalizePercent_(p['OREB%']);
+      rowObj['DREB%'] = normalizePercent_(p['DREB%']);
+      rowObj.FTR = normalizePercent_(p.FTR);
       rowObj['確認ステータス'] = '未確認';
       rowObj['確認者'] = '';
       rowObj['確認日時'] = '';
@@ -196,7 +206,7 @@ function analyzeStatsWithGemini(pdfBlob) {
     contents: [{
       parts: [
         {
-          text: 'PDFの統計表から、個人スタッツだけをJSON配列として抽出してください。説明文は不要です。PlayerNoは背番号です。PlayerIDではありません。TOTALS行、TOTAL行、合計行、チーム合計行は除外してください。数値は数値として返してください。キー: PlayerNo, GS, PTS, eFG%, 3P/M, 3P/A, 3P%, 2P/M, 2P/A, 2P%, FT/M, FT/A, FT%, OREB, DREB, TOTREB, AST, STL, BLK, TO, PF, TF, OF, MIN, +/-, PPP, TO%, OREB%, FTR'
+          text: 'PDFの統計表から、個人スタッツだけをJSON配列として抽出してください。説明文は不要です。PlayerNoは背番号です。PlayerIDではありません。TOTALS行、TOTAL行、合計行、チーム合計行は除外してください。数値は数値として返してください。MINはPDF上の表記のまま返してください。キー: PlayerNo, GS, PTS, eFG%, 3P/M, 3P/A, 3P%, 2P/M, 2P/A, 2P%, FT/M, FT/A, FT%, OREB, DREB, TOTREB, AST, STL, BLK, TO, PF, TF, OF, MIN, +/-, PPP, TO%, OREB%, DREB%, FTR'
         },
         {
           inline_data: {
@@ -295,9 +305,29 @@ function testProcess() {
 }
 
 /**
- * PlayerStats_ImportからPlayerStatsへ正式反映し、反映したGameIDのTeamGameSummaryを再集計する。
+ * 承認済み・未取込・反映エラー空欄のPlayerStats_ImportをPlayerStatsへ正式反映する。
  */
 function approveAndCommitPlayerStatsImport() {
+  approveAndCommitPlayerStatsImportInternal_(null);
+}
+
+/**
+ * 指定GameIDの承認済み・未取込・反映エラー空欄のPlayerStats_ImportだけをPlayerStatsへ正式反映する。
+ */
+function approveAndCommitPlayerStatsImportByGameId(gameId) {
+  const targetGameId = normalizeGameId_(gameId);
+
+  if (!targetGameId) {
+    throw new Error('GameIDが空です。');
+  }
+
+  approveAndCommitPlayerStatsImportInternal_(targetGameId);
+}
+
+/**
+ * PlayerStats_ImportからPlayerStatsへ正式反映し、反映したGameIDのTeamGameSummaryを再集計する。
+ */
+function approveAndCommitPlayerStatsImportInternal_(targetGameId) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
 
   const importSheet = getRequiredSheet_(ss, 'PlayerStats_Import');
@@ -312,7 +342,7 @@ function approveAndCommitPlayerStatsImport() {
 
   appendByHeader_(batchSheet, {
     ImportBatchID: batchId,
-    処理種別: 'PlayerStats正式反映',
+    処理種別: targetGameId ? 'PlayerStats正式反映:' + targetGameId : 'PlayerStats正式反映',
     開始日時: new Date(),
     終了日時: '',
     ステータス: '処理中',
@@ -326,6 +356,7 @@ function approveAndCommitPlayerStatsImport() {
   let successCount = 0;
   let errorCount = 0;
   const affectedGameIds = new Set();
+  const gameLogs = {};
 
   try {
     const importData = readSheetObjects_(importSheet);
@@ -341,17 +372,23 @@ function approveAndCommitPlayerStatsImport() {
 
     importData.rows.forEach(function(rowObj, index) {
       const rowNumber = importData.startRow + index;
+      const gameId = normalizeGameId_(rowObj.GameID);
+
+      if (targetGameId && gameId !== targetGameId) {
+        return;
+      }
 
       if (!isCommitTarget_(rowObj)) {
         return;
       }
 
-      targetCount++;
-
       const seasonId = normalizeText_(rowObj.SeasonID);
-      const gameId = normalizeGameId_(rowObj.GameID);
       const playerNo = normalizePlayerNo_(rowObj.PlayerNo);
       let resolvedPlayerId = '';
+
+      initGameLog_(gameLogs, gameId);
+      gameLogs[gameId].target++;
+      targetCount++;
 
       try {
         resolvedPlayerId = resolvePlayerIdByPlayerNo_(playerNo, playerNoToPlayerId);
@@ -386,12 +423,17 @@ function approveAndCommitPlayerStatsImport() {
         });
 
         affectedGameIds.add(gameId);
+        gameLogs[gameId].success++;
         successCount++;
       } catch (e) {
         errorCount++;
 
         const errorCode = e.errorCode || 'UNKNOWN_ERROR';
         const errorMessage = e.message || String(e);
+        const logMessage = '[' + errorCode + '] 行' + rowNumber + ' PlayerNo=' + playerNo + ' PlayerID=' + resolvedPlayerId + ' ' + errorMessage;
+
+        gameLogs[gameId].error++;
+        gameLogs[gameId].messages.push(logMessage);
 
         appendByHeader_(errorSheet, {
           ErrorID: createId_('ERR'),
@@ -419,13 +461,15 @@ function approveAndCommitPlayerStatsImport() {
       recalcTeamGameSummary(gameId);
     });
 
+    logGameResults_(gameLogs);
+
     updateImportBatch_(batchSheet, batchId, {
       終了日時: new Date(),
       ステータス: errorCount > 0 ? '一部エラー' : '完了',
       対象件数: targetCount,
       成功件数: successCount,
       エラー件数: errorCount,
-      メモ: affectedGameIds.size > 0 ? '再集計GameID: ' + Array.from(affectedGameIds).join(', ') : ''
+      メモ: buildBatchMemo_(gameLogs, affectedGameIds)
     });
 
     Logger.log(
@@ -434,6 +478,8 @@ function approveAndCommitPlayerStatsImport() {
       ', エラー=' + errorCount
     );
   } catch (e) {
+    logGameResults_(gameLogs);
+
     updateImportBatch_(batchSheet, batchId, {
       終了日時: new Date(),
       ステータス: '失敗',
@@ -452,7 +498,7 @@ function approveAndCommitPlayerStatsImport() {
       ErrorCode: 'BATCH_FAILED',
       ErrorMessage: e.message || String(e),
       SeasonID: '',
-      GameID: '',
+      GameID: targetGameId || '',
       PlayerID: '',
       PlayerNo: '',
       RawData: ''
@@ -543,14 +589,14 @@ function recalcTeamGameSummary(gameId) {
     PTS: round1_(totals.PTS),
     '3P/M': round1_(totals['3P/M']),
     '3P/A': round1_(totals['3P/A']),
-    '3P%': safePercent_(totals['3P/M'], totals['3P/A']),
+    '3P%': safeRatio_(totals['3P/M'], totals['3P/A']),
     '2P/M': round1_(totals['2P/M']),
     '2P/A': round1_(totals['2P/A']),
-    '2P%': safePercent_(totals['2P/M'], totals['2P/A']),
+    '2P%': safeRatio_(totals['2P/M'], totals['2P/A']),
     'FT/M': round1_(totals['FT/M']),
     'FT/A': round1_(totals['FT/A']),
-    'FT%': safePercent_(totals['FT/M'], totals['FT/A']),
-    'eFG%': safeDivide_(totals.FGM + 0.5 * totals['3P/M'], totals.FGA, 100),
+    'FT%': safeRatio_(totals['FT/M'], totals['FT/A']),
+    'eFG%': safeRatio_(totals.FGM + 0.5 * totals['3P/M'], totals.FGA),
     OREB: round1_(totals.OREB),
     DREB: round1_(totals.DREB),
     TOTREB: round1_(totals.TOTREB),
@@ -563,8 +609,8 @@ function recalcTeamGameSummary(gameId) {
     FGM: round1_(totals.FGM),
     Poss: round1_(poss),
     PPP: safeDivide_(totals.PTS, poss, 1),
-    'TO%': safeDivide_(totals.TO, poss, 100),
-    FTR: safeDivide_(totals['FT/A'], totals.FGA, 100),
+    'TO%': safeRatio_(totals.TO, poss),
+    FTR: safeRatio_(totals['FT/A'], totals.FGA),
     'AST/TO': safeDivide_(totals.AST, totals.TO, 1)
   };
 
@@ -590,22 +636,18 @@ function recalcTeamGameSummary(gameId) {
 
 /**
  * 正式反映対象行かどうかを判定する。
+ * 承認TRUE、取込済みFALSE、反映エラー空欄のみ対象にする。
  */
 function isCommitTarget_(rowObj) {
   if (isTotalsRow_(rowObj)) {
     return false;
   }
 
-  const imported = toBoolean_(rowObj['取込済み']);
-
-  if (imported) {
-    return false;
-  }
-
   const approved = toBoolean_(rowObj['承認']);
-  const status = normalizeText_(rowObj['確認ステータス']);
+  const imported = toBoolean_(rowObj['取込済み']);
+  const reflectError = normalizeText_(rowObj['反映エラー']);
 
-  return approved || status === '確認済み';
+  return approved && !imported && reflectError === '';
 }
 
 /**
@@ -721,6 +763,16 @@ function buildPlayerStatsRow_(importRow, statsHeaders, resolvedPlayerId) {
 
     if (header === 'PlayerID') {
       row[header] = resolvedPlayerId;
+      return;
+    }
+
+    if (header === 'MIN') {
+      row[header] = normalizeMinutes_(importRow.MIN);
+      return;
+    }
+
+    if (isPercentHeader_(header)) {
+      row[header] = normalizePercent_(importRow[header]);
       return;
     }
 
@@ -1264,6 +1316,56 @@ function getDateValue_(value) {
 }
 
 /**
+ * GAMEID別ログを初期化する。
+ */
+function initGameLog_(gameLogs, gameId) {
+  const normalizedGameId = normalizeGameId_(gameId) || 'UNKNOWN_GAME';
+
+  if (!gameLogs[normalizedGameId]) {
+    gameLogs[normalizedGameId] = {
+      target: 0,
+      success: 0,
+      error: 0,
+      messages: []
+    };
+  }
+}
+
+/**
+ * GAMEID別ログを出力する。
+ */
+function logGameResults_(gameLogs) {
+  Object.keys(gameLogs).sort().forEach(function(gameId) {
+    const log = gameLogs[gameId];
+    Logger.log(gameId + ': 対象' + log.target + '、成功' + log.success + '、エラー' + log.error);
+
+    if (log.messages.length > 0) {
+      log.messages.forEach(function(message) {
+        Logger.log(gameId + ': ' + message);
+      });
+    }
+  });
+}
+
+/**
+ * ImportBatchのメモを作成する。
+ */
+function buildBatchMemo_(gameLogs, affectedGameIds) {
+  const parts = [];
+
+  Object.keys(gameLogs).sort().forEach(function(gameId) {
+    const log = gameLogs[gameId];
+    parts.push(gameId + ' 対象' + log.target + ' 成功' + log.success + ' エラー' + log.error);
+  });
+
+  if (affectedGameIds && affectedGameIds.size > 0) {
+    parts.push('再集計GameID: ' + Array.from(affectedGameIds).join(', '));
+  }
+
+  return parts.join(' / ');
+}
+
+/**
  * TRUE判定。
  */
 function toBoolean_(value) {
@@ -1314,7 +1416,7 @@ function toNumber_(value) {
     return 0;
   }
 
-  const numberValue = Number(String(value).replace(/,/g, ''));
+  const numberValue = Number(String(value).replace(/,/g, '').replace(/%/g, ''));
 
   if (isNaN(numberValue)) {
     return 0;
@@ -1324,11 +1426,121 @@ function toNumber_(value) {
 }
 
 /**
+ * MINを小数分へ正規化する。
+ * PlayerStats.MIN / PlayerStats_Import.MIN は分換算小数で保存する。
+ * 例: 15:33 -> 15.55
+ * 表示上のmm:ssはAppSheet / Looker Studio側で対応予定。
+ */
+function normalizeMinutes_(value) {
+  if (value === null || value === undefined || value === '') {
+    return 0;
+  }
+
+  if (typeof value === 'number') {
+    return round2_(value);
+  }
+
+  const text = String(value).trim();
+
+  if (!text) {
+    return 0;
+  }
+
+  const timeMatch = text.match(/^(\d+)\s*:\s*(\d{1,2})$/);
+
+  if (timeMatch) {
+    const minutes = Number(timeMatch[1]);
+    const seconds = Number(timeMatch[2]);
+
+    if (isNaN(minutes) || isNaN(seconds)) {
+      return 0;
+    }
+
+    return round2_(minutes + seconds / 60);
+  }
+
+  const numberValue = Number(text.replace(/,/g, ''));
+
+  if (isNaN(numberValue)) {
+    return 0;
+  }
+
+  return round2_(numberValue);
+}
+
+/**
+ * パーセンテージを小数形式へ正規化する。
+ * 例: 50% -> 0.5, 50 -> 0.5, 0.5 -> 0.5
+ */
+function normalizePercent_(value) {
+  if (value === null || value === undefined || value === '') {
+    return 0;
+  }
+
+  if (typeof value === 'number') {
+    if (value > 1) {
+      return round3_(value / 100);
+    }
+
+    return round3_(value);
+  }
+
+  const text = String(value).trim();
+
+  if (!text) {
+    return 0;
+  }
+
+  const hasPercentSign = text.indexOf('%') >= 0;
+  const numberValue = Number(text.replace(/,/g, '').replace(/%/g, ''));
+
+  if (isNaN(numberValue)) {
+    return 0;
+  }
+
+  if (hasPercentSign || numberValue > 1) {
+    return round3_(numberValue / 100);
+  }
+
+  return round3_(numberValue);
+}
+
+/**
+ * パーセンテージ列かどうかを判定する。
+ */
+function isPercentHeader_(header) {
+  return header === 'eFG%' ||
+    header === '3P%' ||
+    header === '2P%' ||
+    header === 'FT%' ||
+    header === 'TO%' ||
+    header === 'OREB%' ||
+    header === 'DREB%' ||
+    header === 'FTR';
+}
+
+/**
  * 小数1桁に丸める。
  */
 function round1_(value) {
   const numberValue = toNumber_(value);
   return Math.round(numberValue * 10) / 10;
+}
+
+/**
+ * 小数2桁に丸める。
+ */
+function round2_(value) {
+  const numberValue = toNumber_(value);
+  return Math.round(numberValue * 100) / 100;
+}
+
+/**
+ * 小数3桁に丸める。
+ */
+function round3_(value) {
+  const numberValue = toNumber_(value);
+  return Math.round(numberValue * 1000) / 1000;
 }
 
 /**
@@ -1345,10 +1557,23 @@ function safeDivide_(numerator, denominator, multiplier) {
 }
 
 /**
+ * 0除算を避けて小数形式の比率を計算する。
+ */
+function safeRatio_(numerator, denominator) {
+  const den = toNumber_(denominator);
+
+  if (den === 0) {
+    return 0;
+  }
+
+  return round3_(toNumber_(numerator) / den);
+}
+
+/**
  * 0除算を避けて百分率を計算する。
  */
 function safePercent_(numerator, denominator) {
-  return safeDivide_(numerator, denominator, 100);
+  return safeRatio_(numerator, denominator);
 }
 
 /**
@@ -1380,13 +1605,6 @@ function createImportError_(errorCode, message) {
 /**
  * 既存互換テスト用。
  */
-function testRecalcTeamGameSummary_GAME0603() {
-  recalcTeamGameSummary('GAME0603');
-}
-
-/**
- * 既存互換テスト用。
- */
 function testProcessStatsUpload_GAME0603() {
   processStatsPdfByGameId('GAME0603');
 }
@@ -1397,6 +1615,24 @@ function testProcessStatsUpload_GAME0603() {
 function testProcessStatsUpload_GAME0524() {
   processStatsPdfByGameId('GAME0524');
 }
+
+/**
+ * 既存互換テスト用。
+ */
 function testProcessStatsUpload_GAME0704() {
   processStatsPdfByGameId('GAME0704');
+}
+
+/**
+ * GAME0704正式反映テスト用。
+ */
+function testApproveAndCommit_GAME0704() {
+  approveAndCommitPlayerStatsImportByGameId('GAME0704');
+}
+
+/**
+ * GAME0704再集計テスト用。
+ */
+function testRecalcTeamGameSummary_GAME0704() {
+  recalcTeamGameSummary('GAME0704');
 }
