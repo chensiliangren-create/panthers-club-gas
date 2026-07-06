@@ -10,17 +10,16 @@ const GEMINI_RETRY_SLEEP_MS = 2000;
 
 /**
  * Driveフォルダ内のPDFから、未処理または最新の試合PDFを1件選んで取り込む。
- * 誤選択防止のため、選択されたGameIDとPDF名を必ずログに出す。
  */
 function processLatestStatsPdf() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const folder = getStatsUploadFolder_();
   const games = getGameMasterRows_(ss)
     .filter(function(game) {
-      return game.GameID && game.試合日;
+      return game.GameID && game['試合日'];
     })
     .sort(function(a, b) {
-      return getDateValue_(b.試合日) - getDateValue_(a.試合日);
+      return getDateValue_(b['試合日']) - getDateValue_(a['試合日']);
     });
 
   if (games.length === 0) {
@@ -112,7 +111,6 @@ function processStatsUpload(pdfBlob, gameIdRaw) {
  * Geminiの解析結果をPlayerStats_Importへ書き込む。
  * PlayerStats_Import.PlayerNo にはPDF由来の背番号を入れる。
  * MINは分換算小数で保存する。例: 15:33 -> 15.55
- * 表示上のmm:ssはAppSheet / Looker Studio側で対応し、DB側では計算しやすさを優先する。
  */
 function writeToSheet(statsData, gameId) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -139,16 +137,16 @@ function writeToSheet(statsData, gameId) {
       rowObj.PlayerNo = p.PlayerNo || p.PlayerID || p.No || p['No.'] || '';
       rowObj.GS = p.GS || 0;
       rowObj.PTS = p.PTS || 0;
-      rowObj['eFG%'] = normalizePercent_(p['eFG%']);
+      rowObj['eFG%'] = normalizePercentValue_(p['eFG%']);
       rowObj['3P/M'] = p['3P/M'] || 0;
       rowObj['3P/A'] = p['3P/A'] || 0;
-      rowObj['3P%'] = normalizePercent_(p['3P%']);
+      rowObj['3P%'] = normalizePercentValue_(p['3P%']);
       rowObj['2P/M'] = p['2P/M'] || 0;
       rowObj['2P/A'] = p['2P/A'] || 0;
-      rowObj['2P%'] = normalizePercent_(p['2P%']);
+      rowObj['2P%'] = normalizePercentValue_(p['2P%']);
       rowObj['FT/M'] = p['FT/M'] || 0;
       rowObj['FT/A'] = p['FT/A'] || 0;
-      rowObj['FT%'] = normalizePercent_(p['FT%']);
+      rowObj['FT%'] = normalizePercentValue_(p['FT%']);
       rowObj.OREB = p.OREB || 0;
       rowObj.DREB = p.DREB || 0;
       rowObj.TOTREB = p.TOTREB || 0;
@@ -161,11 +159,11 @@ function writeToSheet(statsData, gameId) {
       rowObj.OF = p.OF || 0;
       rowObj.MIN = normalizeMinutes_(p.MIN);
       rowObj['+/-'] = p['+/-'] || p['±'] || p['ﾂｱ'] || 0;
-      rowObj.PPP = p.PPP || 0;
-      rowObj['TO%'] = normalizePercent_(p['TO%']);
-      rowObj['OREB%'] = normalizePercent_(p['OREB%']);
-      rowObj['DREB%'] = normalizePercent_(p['DREB%']);
-      rowObj.FTR = normalizePercent_(p.FTR);
+      rowObj.PPP = calculatePpp_(p.PTS, p['3P/A'], p['2P/A'], p['FT/A'], p.TO);
+      rowObj['TO%'] = normalizePercentValue_(p['TO%']);
+      rowObj['OREB%'] = normalizePercentValue_(p['OREB%']);
+      rowObj['DREB%'] = normalizePercentValue_(p['DREB%']);
+      rowObj.FTR = normalizePercentValue_(p.FTR);
       rowObj['確認ステータス'] = '未確認';
       rowObj['確認者'] = '';
       rowObj['確認日時'] = '';
@@ -608,7 +606,7 @@ function recalcTeamGameSummary(gameId) {
     FGA: round1_(totals.FGA),
     FGM: round1_(totals.FGM),
     Poss: round1_(poss),
-    PPP: safeDivide_(totals.PTS, poss, 1),
+    PPP: calculatePpp_(totals.PTS, totals['3P/A'], totals['2P/A'], totals['FT/A'], totals.TO),
     'TO%': safeRatio_(totals.TO, poss),
     FTR: safeRatio_(totals['FT/A'], totals.FGA),
     'AST/TO': safeDivide_(totals.AST, totals.TO, 1)
@@ -636,7 +634,6 @@ function recalcTeamGameSummary(gameId) {
 
 /**
  * 正式反映対象行かどうかを判定する。
- * 承認TRUE、取込済みFALSE、反映エラー空欄のみ対象にする。
  */
 function isCommitTarget_(rowObj) {
   if (isTotalsRow_(rowObj)) {
@@ -771,8 +768,13 @@ function buildPlayerStatsRow_(importRow, statsHeaders, resolvedPlayerId) {
       return;
     }
 
+    if (header === 'PPP') {
+      row[header] = calculatePpp_(importRow.PTS, importRow['3P/A'], importRow['2P/A'], importRow['FT/A'], importRow.TO);
+      return;
+    }
+
     if (isPercentHeader_(header)) {
-      row[header] = normalizePercent_(importRow[header]);
+      row[header] = normalizePercentValue_(importRow[header]);
       return;
     }
 
@@ -1195,8 +1197,8 @@ function getStatsUploadFolder_() {
 function findPdfFileForGame_(folder, game) {
   const files = folder.getFiles();
   const gameId = normalizeGameId_(game.GameID);
-  const ymd = formatGameDateYmd_(game.試合日);
-  const opponent = normalizeFileToken_(game.対戦相手);
+  const ymd = formatGameDateYmd_(game['試合日']);
+  const opponent = normalizeFileToken_(game['対戦相手']);
   const displayGame = normalizeFileToken_(game.DisplayGame);
 
   let fallback = null;
@@ -1426,10 +1428,7 @@ function toNumber_(value) {
 }
 
 /**
- * MINを小数分へ正規化する。
- * PlayerStats.MIN / PlayerStats_Import.MIN は分換算小数で保存する。
- * 例: 15:33 -> 15.55
- * 表示上のmm:ssはAppSheet / Looker Studio側で対応予定。
+ * MINを分換算小数へ正規化する。
  */
 function normalizeMinutes_(value) {
   if (value === null || value === undefined || value === '') {
@@ -1470,7 +1469,6 @@ function normalizeMinutes_(value) {
 
 /**
  * パーセンテージを小数形式へ正規化する。
- * 例: 50% -> 0.5, 50 -> 0.5, 0.5 -> 0.5
  */
 function normalizePercent_(value) {
   if (value === null || value === undefined || value === '') {
@@ -1499,6 +1497,48 @@ function normalizePercent_(value) {
   }
 
   if (hasPercentSign || numberValue > 1) {
+    return round3_(numberValue / 100);
+  }
+
+  return round3_(numberValue);
+}
+
+/**
+ * パーセンテージを小数形式へ正規化する。
+ */
+function normalizePercentValue_(value) {
+  return normalizePercent_(value);
+}
+
+/**
+ * PPPを計算する。
+ * PPP = PTS / (3P/A + 2P/A + 0.44 * FT/A + TO)
+ */
+function calculatePpp_(pts, threePa, twoPa, fta, turnovers) {
+  const denominator =
+    toNumber_(threePa) +
+    toNumber_(twoPa) +
+    0.44 * toNumber_(fta) +
+    toNumber_(turnovers);
+
+  if (denominator === 0) {
+    return 0;
+  }
+
+  return round3_(toNumber_(pts) / denominator);
+}
+
+/**
+ * PPP値を正規化する。
+ */
+function normalizePppValue_(value) {
+  if (value === null || value === undefined || value === '') {
+    return 0;
+  }
+
+  const numberValue = toNumber_(value);
+
+  if (numberValue > 10) {
     return round3_(numberValue / 100);
   }
 
@@ -1635,4 +1675,113 @@ function testApproveAndCommit_GAME0704() {
  */
 function testRecalcTeamGameSummary_GAME0704() {
   recalcTeamGameSummary('GAME0704');
+}
+
+/**
+ * PlayerStatsの既存データを安全に一括クレンジングする。
+ */
+function cleanupPlayerStatsData() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = getRequiredSheet_(ss, 'PlayerStats');
+  const lastRow = sheet.getLastRow();
+
+  if (lastRow < 2) {
+    Logger.log('PlayerStats: クレンジング対象データがありません。');
+    return;
+  }
+
+  let updatedColumns = 0;
+
+  updatedColumns += cleanupColumnByHeader_(sheet, 'MIN', function(value) {
+    return normalizeMinutes_(value);
+  });
+
+  [
+    '3P%',
+    '2P%',
+    'FT%',
+    'eFG%',
+    'TO%',
+    'OREB%',
+    'DREB%',
+    'FTR'
+  ].forEach(function(header) {
+    updatedColumns += cleanupColumnByHeader_(sheet, header, function(value) {
+      return normalizePercentValue_(value);
+    });
+  });
+
+  updatedColumns += cleanupColumnByHeader_(sheet, 'PPP', function(value) {
+    return normalizePppValue_(value);
+  });
+
+  Logger.log('PlayerStats クレンジング完了: 更新対象列=' + updatedColumns);
+}
+
+/**
+ * TeamGameSummaryの既存データを安全に一括クレンジングする。
+ */
+function cleanupTeamGameSummaryData() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = getRequiredSheet_(ss, 'TeamGameSummary');
+  const lastRow = sheet.getLastRow();
+
+  if (lastRow < 2) {
+    Logger.log('TeamGameSummary: クレンジング対象データがありません。');
+    return;
+  }
+
+  let updatedColumns = 0;
+
+  [
+    '3P%',
+    '2P%',
+    'FT%',
+    'eFG%',
+    'TO%',
+    'OREB%',
+    'DREB%',
+    'FTR'
+  ].forEach(function(header) {
+    updatedColumns += cleanupColumnByHeader_(sheet, header, function(value) {
+      return normalizePercentValue_(value);
+    });
+  });
+
+  updatedColumns += cleanupColumnByHeader_(sheet, 'PPP', function(value) {
+    return normalizePppValue_(value);
+  });
+
+  Logger.log('TeamGameSummary クレンジング完了: 更新対象列=' + updatedColumns);
+}
+
+/**
+ * 指定ヘッダーの列だけを安全にクレンジングする。
+ */
+function cleanupColumnByHeader_(sheet, headerName, transformFn) {
+  const headerMap = getHeaderMap_(sheet);
+  const column = headerMap[headerName];
+  const lastRow = sheet.getLastRow();
+
+  if (!column) {
+    Logger.log(sheet.getName() + ': 列が存在しないためスキップ: ' + headerName);
+    return 0;
+  }
+
+  if (lastRow < 2) {
+    Logger.log(sheet.getName() + ': データ行がないためスキップ: ' + headerName);
+    return 0;
+  }
+
+  const range = sheet.getRange(2, column, lastRow - 1, 1);
+  const values = range.getValues();
+
+  const newValues = values.map(function(row) {
+    return [transformFn(row[0])];
+  });
+
+  range.setValues(newValues);
+
+  Logger.log(sheet.getName() + ': クレンジング完了: ' + headerName + ' / ' + newValues.length + '行');
+  return 1;
 }
